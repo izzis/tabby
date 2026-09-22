@@ -28,6 +28,12 @@ const COLOR_NAMES = [
 // Fcitx5 applies Chinese punctuation during the browser's default text-input
 // processing. If xterm handles these keys on keydown, it calls preventDefault()
 // before Fcitx5 can emit the converted keypress/input event.
+//
+// NOTE: this deferral must only happen when an IME is actually involved.
+// Unconditionally returning false on Linux breaks these keys when no IME
+// (or a non-Fcitx IME like ibus-simple) is in use: xterm skips keydown and the
+// fallback keypress/input event never arrives, so symbols like , . ; : / ? etc.
+// are lost entirely.
 const LINUX_IME_TEXT_KEY_CODES = new Set([
     'Backquote',
     'Backslash',
@@ -40,11 +46,49 @@ const LINUX_IME_TEXT_KEY_CODES = new Set([
     'Slash',
 ])
 
+function isFcitxActive (): boolean {
+    try {
+        if (typeof process === 'undefined') {
+            return false
+        }
+        const env = process.env
+        return [env.GTK_IM_MODULE, env.QT_IM_MODULE, env.XMODIFIERS]
+            .some(v => typeof v === 'string' && v.toLowerCase().includes('fcitx'))
+    } catch {
+        return false
+    }
+}
+
+function isIMEComposing (event: KeyboardEvent): boolean {
+    return !!event.isComposing || event.keyCode === 229 || event.key === 'Process'
+}
+
 function isIMETextKey (event: KeyboardEvent): boolean {
     if (event.ctrlKey || event.altKey || event.metaKey) {
         return false
     }
     return LINUX_IME_TEXT_KEY_CODES.has(event.code) || event.code === 'Space' && event.shiftKey
+}
+
+function shouldDeferToIME (event: KeyboardEvent): boolean {
+    // Only ever defer real keydown events. xterm also routes keypress/keyup
+    // through the same custom handler; deferring those would block the very
+    // fallback path plain keyboards rely on.
+    if (event.type !== 'keydown') {
+        return false
+    }
+    if (!isIMETextKey(event)) {
+        return false
+    }
+    // An IME composition in progress always wins, regardless of which IME.
+    if (isIMEComposing(event)) {
+        return true
+    }
+    // Otherwise only Fcitx (the setup this workaround was tested with:
+    // Ubuntu + X11 + Fcitx5) gets the deferral. Plain US keyboards and
+    // non-Fcitx IMEs (e.g. ibus-simple) keep going through xterm's keydown
+    // path, which is the only path that delivers the character for them.
+    return isFcitxActive()
 }
 
 // How many times to recreate the WebGL renderer after a lost GPU context
@@ -264,10 +308,10 @@ export class XTermFrontend extends Frontend {
                 return false
             }
 
-            if (this.hostApp.platform === Platform.Linux && isIMETextKey(event)) {
+            if (this.hostApp.platform === Platform.Linux && shouldDeferToIME(event)) {
                 // Returning false keeps xterm from sending/cancelling keydown.
-                // The resulting keypress/input event contains either the IME
-                // commit string or the original character when IME is inactive.
+                // The resulting keypress/input event contains the IME commit
+                // string. Plain keys (no IME) keep using xterm's keydown path.
                 return false
             }
 
